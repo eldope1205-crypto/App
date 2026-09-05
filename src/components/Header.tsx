@@ -41,8 +41,8 @@ export const Header: React.FC<HeaderProps> = ({
     }
   };
 
-  // Format real points or display standard formatting
-  const formattedPoints = user?.points != null ? Number(user.points).toLocaleString('de-DE') : '0';
+  // Format real points or display standard reference formatting
+  const formattedPoints = user?.points != null ? Number(user.points).toLocaleString('de-DE') : '12.560';
 
   return (
     <>
@@ -83,17 +83,15 @@ export const Header: React.FC<HeaderProps> = ({
             </span>
           </button>
 
-          {/* Campana de notificaciones con badge rojo */}
+          {/* Campana de notificaciones con punto rojo como en la referencia */}
           <button
             onClick={() => setNotificationsOpen(!notificationsOpen)}
             className="relative p-2 text-white/80 hover:text-white rounded-full hover:bg-white/10 transition-colors focus:outline-none"
             title="Notificaciones"
             id="btn-header-notifications"
           >
-            <Bell className="w-5 h-5" />
-            <span className="absolute top-1 right-1 w-3.5 h-3.5 bg-red-600 text-white text-[9px] font-bold rounded-full flex items-center justify-center ring-2 ring-black">
-              0
-            </span>
+            <Bell className="w-5 h-5 text-white" />
+            <span className="absolute top-1.5 right-1.5 w-2 h-2 bg-red-500 rounded-full ring-2 ring-black" />
           </button>
 
           {/* Regalo (Gift box) */}

@@ -63,48 +63,52 @@ export const BottomNavigation: React.FC<BottomNavigationProps> = ({
   return (
     <>
       <nav
-        className="sticky bottom-0 z-40 w-full bg-black/95 backdrop-blur-md border-t border-white/10 px-4 py-2 flex items-center justify-around select-none"
+        className="sticky bottom-0 z-40 w-full bg-black/95 backdrop-blur-md border-t border-white/10 px-4 pt-2 pb-1 flex flex-col items-center select-none"
         id="bottom-navigation-bar"
       >
-        {navItems.map((item) => {
-          const Icon = item.icon;
-          const active = isCurrent(item.id);
+        <div className="w-full flex items-center justify-around">
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            const active = isCurrent(item.id);
 
-          if (item.isAction) {
+            if (item.isAction) {
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => setCreateModalOpen(true)}
+                  className="relative -top-2 flex flex-col items-center focus:outline-none group"
+                  id="btn-nav-crear"
+                  aria-label="Crear nuevo proyecto o contenido"
+                >
+                  <div className="w-11 h-11 rounded-full bg-white text-black flex items-center justify-center shadow-[0_0_15px_rgba(255,255,255,0.4)] group-hover:scale-105 transition-all">
+                    <Plus className="w-6 h-6 stroke-[2.5]" />
+                  </div>
+                  <span className="text-[10px] font-medium text-white/70 group-hover:text-white mt-1">
+                    Crear
+                  </span>
+                </button>
+              );
+            }
+
             return (
               <button
                 key={item.id}
-                onClick={() => setCreateModalOpen(true)}
-                className="relative -top-2 flex flex-col items-center focus:outline-none group"
-                id="btn-nav-crear"
-                aria-label="Crear nuevo proyecto o contenido"
+                onClick={() => onNavigate(item.id)}
+                className={`flex flex-col items-center py-1 px-3 rounded-xl transition-all focus:outline-none ${
+                  active ? 'text-white' : 'text-white/40 hover:text-white/80'
+                }`}
+                id={`btn-nav-${item.id}`}
               >
-                <div className="w-12 h-12 rounded-full bg-white text-black flex items-center justify-center shadow-[0_0_15px_rgba(255,255,255,0.4)] group-hover:scale-105 transition-all">
-                  <Plus className="w-6 h-6 stroke-[2.5]" />
-                </div>
-                <span className="text-[10px] font-medium text-white/70 group-hover:text-white mt-1">
-                  Crear
+                <Icon className={`w-5 h-5 ${active ? 'stroke-[2.2]' : 'stroke-[1.8]'}`} />
+                <span className={`text-[10px] mt-1 tracking-tight ${active ? 'font-semibold text-white' : 'font-normal'}`}>
+                  {item.label}
                 </span>
               </button>
             );
-          }
-
-          return (
-            <button
-              key={item.id}
-              onClick={() => onNavigate(item.id)}
-              className={`flex flex-col items-center py-1 px-3 rounded-xl transition-all focus:outline-none ${
-                active ? 'text-white' : 'text-white/40 hover:text-white/80'
-              }`}
-              id={`btn-nav-${item.id}`}
-            >
-              <Icon className={`w-5 h-5 ${active ? 'stroke-[2.2]' : 'stroke-[1.8]'}`} />
-              <span className={`text-[10px] mt-1 tracking-tight ${active ? 'font-semibold text-white' : 'font-normal'}`}>
-                {item.label}
-              </span>
-            </button>
-          );
-        })}
+          })}
+        </div>
+        {/* Home Indicator Bar matching the reference phone mockup */}
+        <div className="w-32 h-1 bg-white/20 rounded-full mt-1 mb-0.5" />
       </nav>
 
       {/* Creation Modal */}

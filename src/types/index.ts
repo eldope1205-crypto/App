@@ -1,5 +1,5 @@
-export type UserRole = 'USER' | 'CREATOR' | 'ADMIN' | 'user' | 'creator' | 'admin';
-export type UserPlan = 'FREE' | 'CREATOR' | 'PRO' | 'ENTERPRISE' | 'free' | 'creator' | 'pro' | 'studio';
+export type UserRole = 'OWNER' | 'SUPER_ADMIN' | 'ADMIN' | 'USER' | 'CREATOR' | 'owner' | 'super_admin' | 'admin' | 'user' | 'creator';
+export type UserPlan = 'FREE' | 'STARTER' | 'CREATOR' | 'PRO' | 'ULTRA' | 'ENTERPRISE' | 'free' | 'starter' | 'creator' | 'pro' | 'ultra' | 'enterprise';
 export type UserStatus = 'ACTIVE' | 'SUSPENDED' | 'active' | 'suspended';
 
 export interface User {
@@ -14,8 +14,78 @@ export interface User {
   is_active?: number | boolean;
   avatar?: string;
   created_at?: string;
+  updated_at?: string;
   projects_count?: number;
   assets_count?: number;
+}
+
+export interface AuditLog {
+  id: string;
+  user_id?: string;
+  user_email: string;
+  role: string;
+  action: string;
+  resource: string;
+  details?: string;
+  ip_address?: string;
+  created_at: string;
+}
+
+export interface PlanConfig {
+  id: string;
+  name: string;
+  code: string;
+  price_monthly: number;
+  currency: string;
+  points_monthly: number;
+  max_resolution: string;
+  features: string;
+  is_active: number;
+  sort_order: number;
+}
+
+export interface PointsPackage {
+  id: string;
+  name: string;
+  points: number;
+  price: number;
+  bonus_points: number;
+  is_active: number;
+  is_popular: number;
+  sort_order: number;
+}
+
+export interface ToolConfig {
+  id: string;
+  name: string;
+  enabled: boolean;
+  points_cost: number;
+  provider: string;
+  model: string;
+  priority: number;
+}
+
+export interface ContentPage {
+  id: string;
+  slug: string;
+  title: string;
+  content: string;
+  is_published: number;
+  updated_at: string;
+  updated_by?: string;
+}
+
+export interface TemplateItem {
+  id: string;
+  title: string;
+  category: string;
+  description?: string;
+  thumbnail?: string;
+  aspect_ratio: string;
+  data: string;
+  is_active: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface PointsTransaction {

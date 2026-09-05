@@ -16,15 +16,25 @@ import {
   User,
 } from 'lucide-react';
 
+import { apiRequest } from '../lib/api';
+
 interface LoginViewProps {
   onNavigate: (view: 'login' | 'register' | 'recover' | string) => void;
+  initialMode?: 'login' | 'register' | 'recover';
 }
 
-export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
+export const LoginView: React.FC<LoginViewProps> = ({ onNavigate, initialMode = 'login' }) => {
   const { login, register } = useAuth();
 
   // Mode: 'login' | 'register' | 'recover'
-  const [mode, setMode] = useState<'login' | 'register' | 'recover'>('login');
+  const [mode, setMode] = useState<'login' | 'register' | 'recover'>(initialMode);
+
+  // Sync mode if initialMode prop changes
+  React.useEffect(() => {
+    if (initialMode && initialMode !== mode) {
+      setMode(initialMode);
+    }
+  }, [initialMode]);
 
   // Form states
   const [name, setName] = useState('');
@@ -39,6 +49,13 @@ export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
   const [modalType, setModalType] = useState<'terms' | 'privacy' | 'oauth' | null>(null);
   const [oauthProvider, setOauthProvider] = useState<string>('');
 
+  const switchMode = (newMode: 'login' | 'register' | 'recover') => {
+    setMode(newMode);
+    setError(null);
+    setSuccessMessage(null);
+    onNavigate(newMode);
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
@@ -51,14 +68,11 @@ export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
       }
       setLoading(true);
       try {
-        const res = await fetch('/api/auth/request-reset', {
+        const data = await apiRequest<{ message: string; resetToken?: string }>('/auth/recover', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ email: email.trim() }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Error al solicitar recuperación.');
-        setSuccessMessage('Si el correo existe en el sistema, recibirás un enlace de restablecimiento.');
+        setSuccessMessage(data.message || 'Si el correo existe en el sistema, recibirás un enlace de restablecimiento.');
       } catch (err: any) {
         setError(err.message || 'Error al procesar la solicitud.');
       } finally {
@@ -262,11 +276,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
             <div className="flex justify-end pt-0.5">
               <button
                 type="button"
-                onClick={() => {
-                  setMode('recover');
-                  setError(null);
-                  setSuccessMessage(null);
-                }}
+                onClick={() => switchMode('recover')}
                 className="text-xs text-white/60 hover:text-white underline underline-offset-4 transition-colors font-medium"
                 id="btn-forgot-password"
               >
@@ -359,11 +369,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
               ¿No tienes cuenta?{' '}
               <button
                 type="button"
-                onClick={() => {
-                  setMode('register');
-                  setError(null);
-                  setSuccessMessage(null);
-                }}
+                onClick={() => switchMode('register')}
                 className="text-white font-bold hover:underline ml-1"
                 id="btn-switch-register"
               >
@@ -375,11 +381,7 @@ export const LoginView: React.FC<LoginViewProps> = ({ onNavigate }) => {
               ¿Ya tienes una cuenta?{' '}
               <button
                 type="button"
-                onClick={() => {
-                  setMode('login');
-                  setError(null);
-                  setSuccessMessage(null);
-                }}
+                onClick={() => switchMode('login')}
                 className="text-white font-bold hover:underline ml-1"
                 id="btn-switch-login"
               >

@@ -3,8 +3,15 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import multer from "multer";
-import { createServer as createViteServer } from "vite";
-import { db, hashPassword, verifyPassword, logSystem } from "./server/db.ts";
+import {
+  db,
+  hashPassword,
+  verifyPassword,
+  logSystem,
+  logAudit,
+  getSystemSetting,
+  setSystemSetting
+} from "./server/db.ts";
 import {
   getApiStatusSummary,
   planDirectorProject,
@@ -17,10 +24,21 @@ import {
   isStripeConfigured,
 } from "./server/gemini.ts";
 
-// Setup uploads directory
-const UPLOADS_DIR = path.join(process.cwd(), "uploads");
+// Configuración de Propietario (OWNER) & Super Admin
+export const CONFIGURED_OWNER_EMAIL = (process.env.OWNER_EMAIL || "eldope1205@gmail.com").trim().toLowerCase();
+export const OWNER_SETUP_KEY = (process.env.OWNER_SETUP_KEY || process.env.ADMIN_SECRET_KEY || "grey_ia_owner_master_2026").trim();
+
+
+// Setup uploads directory (adaptive for Vercel /tmp)
+const UPLOADS_DIR = process.env.VERCEL
+  ? path.join("/tmp", "uploads")
+  : path.join(process.cwd(), "uploads");
 if (!fs.existsSync(UPLOADS_DIR)) {
-  fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+  } catch (err) {
+    console.warn("Could not create uploads directory:", err);
+  }
 }
 
 // Multer storage
@@ -39,12 +57,31 @@ const upload = multer({
   limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
 });
 
-const app = express();
+export const app = express();
 const PORT = 3000;
 
 // Essential middlewares
 app.use(express.json({ limit: "25mb" }));
 app.use(express.urlencoded({ extended: true, limit: "25mb" }));
+
+// Route normalizer to ensure API routes match regardless of Vercel rewrite prefix
+app.use((req, _res, next) => {
+  if (
+    !req.url.startsWith("/api") &&
+    !req.url.startsWith("/uploads") &&
+    (req.url.startsWith("/auth") ||
+      req.url.startsWith("/projects") ||
+      req.url.startsWith("/chat") ||
+      req.url.startsWith("/ai") ||
+      req.url.startsWith("/points") ||
+      req.url.startsWith("/admin") ||
+      req.url.startsWith("/health") ||
+      req.url.startsWith("/library"))
+  ) {
+    req.url = "/api" + (req.url.startsWith("/") ? req.url : "/" + req.url);
+  }
+  next();
+});
 
 // Static uploads
 app.use("/uploads", express.static(UPLOADS_DIR));
@@ -87,11 +124,34 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
       res.status(403).json({ error: "Esta cuenta se encuentra suspendida por la administración." });
       return;
     }
+    let userRole = row.role;
+    // Auto-promoción de OWNER si coincide con la configuración segura
+    if (row.email && row.email.toLowerCase() === CONFIGURED_OWNER_EMAIL) {
+      if (userRole !== "OWNER") {
+        userRole = "OWNER";
+        db.prepare("UPDATE users SET role = 'OWNER', updated_at = ? WHERE id = ?").run(new Date().toISOString(), row.user_id);
+        logAudit(row.user_id, row.email, 'OWNER', 'OWNER_PROMOTED_BY_CONFIG', 'system', 'Reconocimiento automático de cuenta Propietario (OWNER)');
+      }
+    }
+
+    // Modo Mantenimiento
+    const maintenance = getSystemSetting("maintenance", { enabled: false, message: "" });
+    if (maintenance?.enabled) {
+      const isPrivileged = userRole === "OWNER" || userRole === "SUPER_ADMIN" || userRole === "ADMIN";
+      if (!isPrivileged) {
+        res.status(503).json({
+          error: maintenance.message || "La plataforma GREY IA se encuentra en mantenimiento programado. Volveremos pronto.",
+          isMaintenance: true,
+        });
+        return;
+      }
+    }
+
     req.user = {
       id: row.user_id,
       email: row.email,
       name: row.name,
-      role: row.role,
+      role: userRole,
       points: row.points,
       plan: row.plan,
       status: row.status,
@@ -104,14 +164,45 @@ function requireAuth(req: AuthenticatedRequest, res: Response, next: NextFunctio
   }
 }
 
-// Admin Middleware - Strict Server Verification
+// Admin Middleware - Soporta OWNER, SUPER_ADMIN y ADMIN
 function requireAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
-  if (!req.user || req.user.role !== "ADMIN") {
+  if (!req.user || (req.user.role !== "OWNER" && req.user.role !== "SUPER_ADMIN" && req.user.role !== "ADMIN")) {
     logSystem("WARN", "AUTH", `Intento no autorizado al panel de administración por usuario ${req.user?.email || "desconocido"}`);
-    res.status(403).json({ error: "Acceso denegado. Se requieren privilegios de Administrador del sistema." });
+    logAudit(req.user?.id || null, req.user?.email || "desconocido", req.user?.role || "USER", "UNAUTHORIZED_ADMIN_ACCESS", "admin_panel", "Intento de acceso bloqueado", req.ip);
+    res.status(403).json({ error: "Acceso denegado. Se requieren privilegios de Administrador o Super Administrador." });
     return;
   }
   next();
+}
+
+// Super Admin Middleware - Solo OWNER y SUPER_ADMIN
+function requireSuperAdmin(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user || (req.user.role !== "OWNER" && req.user.role !== "SUPER_ADMIN")) {
+    logSystem("WARN", "AUTH", `Acceso denegado a acción de Super Admin: ${req.user?.email || "desconocido"}`);
+    logAudit(req.user?.id || null, req.user?.email || "desconocido", req.user?.role || "USER", "UNAUTHORIZED_SUPERADMIN_ACCESS", "super_admin_panel", "Requerido rol SUPER_ADMIN u OWNER", req.ip);
+    res.status(403).json({ error: "Acceso denegado. Esta acción requiere privilegios de SUPER ADMINISTRADOR o PROPIETARIO (OWNER)." });
+    return;
+  }
+  next();
+}
+
+// Owner Middleware - Exclusivo para el PROPIETARIO ABSOLUTO
+function requireOwner(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+  if (!req.user || req.user.role !== "OWNER") {
+    logSystem("WARN", "AUTH", `Acceso denegado a acción exclusiva de OWNER: ${req.user?.email || "desconocido"}`);
+    logAudit(req.user?.id || null, req.user?.email || "desconocido", req.user?.role || "USER", "UNAUTHORIZED_OWNER_ACCESS", "owner_panel", "Requerido rol OWNER", req.ip);
+    res.status(403).json({ error: "Acceso denegado. Esta acción es de control total y está reservada exclusivamente para el PROPIETARIO (OWNER) de la plataforma." });
+    return;
+  }
+  next();
+}
+
+// Helper para verificar permisos administrativos
+function hasAdminPermission(userId: string, userRole: string, permission: string): boolean {
+  if (userRole === "OWNER" || userRole === "SUPER_ADMIN") return true;
+  if (userRole !== "ADMIN") return false;
+  const perm = db.prepare("SELECT id FROM admin_permissions WHERE user_id = ? AND permission = ?").get(userId, permission);
+  return Boolean(perm);
 }
 
 // Points helper
@@ -201,7 +292,7 @@ app.post("/api/auth/register", (req, res) => {
     const { hash, salt } = hashPassword(password);
     const userId = crypto.randomUUID();
     const now = new Date().toISOString();
-    const initialPoints = role === "ADMIN" ? 99999 : 250;
+    const initialPoints = role === "ADMIN" ? 99999 : 12560;
 
     const insertUser = db.prepare(`
       INSERT INTO users (id, email, password_hash, salt, name, role, points, plan, status, verified, created_at, updated_at)
@@ -319,7 +410,7 @@ app.post("/api/auth/logout", (req, res) => {
   res.json({ message: "Sesión cerrada correctamente." });
 });
 
-app.post("/api/auth/recover", (req, res) => {
+app.post(["/api/auth/recover", "/api/auth/request-reset"], (req, res) => {
   const { email } = req.body;
   if (!email) {
     res.status(400).json({ error: "Proporcione el correo electrónico." });
@@ -1062,7 +1153,7 @@ function seedInitialUserProjects(userId: string) {
     const now = Date.now();
     const sampleProjects = [
       {
-        title: "Video TikTok IA Futuro",
+        title: "Vídeo TikTok IA Futuro",
         description: "Visuales de astronauta con anillos violeta generados por IA",
         aspect_ratio: "9:16",
         duration: 15,
@@ -1093,7 +1184,7 @@ function seedInitialUserProjects(userId: string) {
         description: "Composición de explorador cósmico con horizonte planetario",
         aspect_ratio: "1:1",
         duration: 5,
-        thumbnail: "/uploads/grey_ia_hero.jpg",
+        thumbnail: "/uploads/project_astronaut_neon.jpg",
         progress: 100,
         offsetMs: 3 * 24 * 60 * 60 * 1000,
       },
@@ -1125,7 +1216,7 @@ function seedInitialUserProjects(userId: string) {
         offsetMs: 5 * 24 * 60 * 60 * 1000,
       },
       {
-        title: "Video Promo Producto",
+        title: "Vídeo Promo Producto",
         description: "Spot publicitario para perfume de lujo con gotas de agua sobre obsidiana",
         aspect_ratio: "1:1",
         duration: 15,
@@ -1397,51 +1488,157 @@ app.post("/api/payments/create-checkout-session", requireAuth, (req: Authenticat
 });
 
 // ------------------------------------------
-// PANEL DE ADMINISTRACIÓN (PRIVADO & PROTEGIDO)
+// CONFIGURACIÓN PÚBLICA & ESTADO DEL SISTEMA
 // ------------------------------------------
 
-app.get("/api/admin/stats", requireAuth, requireAdmin, (_req, res) => {
+app.get("/api/system/public-config", (_req, res) => {
+  try {
+    const publishedDesign = getSystemSetting("design_published", {
+      platform_title: "GREY IA",
+      tagline: "Tu herramienta definitiva de Inteligencia Artificial",
+      hero_title: "¡Hola! 👋",
+      hero_subtitle: "¿Qué vamos a crear hoy?",
+      announcement_banner: "",
+      banner_active: false,
+      footer_text: "GREY IA — Plataforma Autónoma de Producción Audiovisual con Inteligencia Artificial.",
+    });
+    const general = getSystemSetting("general", {
+      welcome_points: 12560,
+      currency_symbol: "€",
+      max_upload_mb: 50,
+    });
+    const maintenance = getSystemSetting("maintenance", { enabled: false, message: "" });
+    const featureFlags = getSystemSetting("feature_flags", {});
+    const tools = getSystemSetting("tools_config", []);
+
+    res.json({
+      design: publishedDesign,
+      general,
+      maintenance: {
+        enabled: Boolean(maintenance?.enabled),
+        message: maintenance?.message || "",
+      },
+      featureFlags,
+      tools,
+      ownerConfigured: Boolean(CONFIGURED_OWNER_EMAIL),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Error obteniendo configuración del sistema." });
+  }
+});
+
+// Reclamar o Inicializar Rol OWNER
+app.post("/api/admin/claim-owner", requireAuth, (req: AuthenticatedRequest, res) => {
+  const { setupKey } = req.body;
+  const user = req.user!;
+
+  const isConfiguredEmail = user.email.toLowerCase() === CONFIGURED_OWNER_EMAIL;
+  const isValidKey = setupKey && setupKey === OWNER_SETUP_KEY;
+  const totalOwners = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'OWNER'").get() as any).count;
+
+  if (isConfiguredEmail || isValidKey || totalOwners === 0) {
+    db.prepare("UPDATE users SET role = 'OWNER', updated_at = ? WHERE id = ?").run(new Date().toISOString(), user.id);
+    logAudit(user.id, user.email, "OWNER", "CLAIM_OWNER_SUCCESS", "system", `Rol OWNER activado para ${user.email}`, req.ip);
+    res.json({
+      success: true,
+      message: `¡Privilegios de PROPIETARIO (OWNER) activados exitosamente para ${user.email}!`,
+      role: "OWNER",
+    });
+    return;
+  }
+
+  logAudit(user.id, user.email, user.role, "CLAIM_OWNER_FAILED", "system", "Clave de configuración inválida o correo no autorizado", req.ip);
+  res.status(403).json({
+    error: "No se pudo verificar la propiedad de la plataforma. La clave proporcionada es incorrecta o tu cuenta no está autorizada en OWNER_EMAIL.",
+  });
+});
+
+// ------------------------------------------
+// PANEL DE SUPER ADMINISTRADOR & OWNER (CONTROL TOTAL)
+// ------------------------------------------
+
+// 1. Overview Ejecutivo & Métricas en Tiempo Real
+app.get("/api/admin/overview", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
   try {
     const totalUsers = (db.prepare("SELECT COUNT(*) as count FROM users").get() as any).count;
     const activeUsers = (db.prepare("SELECT COUNT(*) as count FROM users WHERE status = 'ACTIVE'").get() as any).count;
     const suspendedUsers = (db.prepare("SELECT COUNT(*) as count FROM users WHERE status = 'SUSPENDED'").get() as any).count;
+    const ownersCount = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'OWNER'").get() as any).count;
+    const superAdminsCount = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'SUPER_ADMIN'").get() as any).count;
+    const adminsCount = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role = 'ADMIN'").get() as any).count;
+
     const totalProjects = (db.prepare("SELECT COUNT(*) as count FROM projects").get() as any).count;
+    const totalAssets = (db.prepare("SELECT COUNT(*) as count FROM library_assets").get() as any).count;
+    const totalStorageBytes = (db.prepare("SELECT COALESCE(SUM(size), 0) as sum FROM library_assets").get() as any).sum;
+
     const totalGenerations = (db.prepare("SELECT COUNT(*) as count FROM points_transactions WHERE type = 'USAGE'").get() as any).count;
     const totalPointsConsumed = (db.prepare("SELECT ABS(COALESCE(SUM(amount), 0)) as sum FROM points_transactions WHERE type = 'USAGE'").get() as any).sum;
-    const totalAssets = (db.prepare("SELECT COUNT(*) as count FROM library_assets").get() as any).count;
-    const subscriptionsCount = (db.prepare("SELECT COUNT(*) as count FROM subscriptions WHERE status = 'ACTIVE'").get() as any).count;
+    const totalPointsPurchased = (db.prepare("SELECT COALESCE(SUM(amount), 0) as sum FROM points_transactions WHERE type = 'PURCHASE'").get() as any).sum;
 
-    // Feature breakdown
-    const featureBreakdown = db.prepare(`
-      SELECT feature, COUNT(*) as count, ABS(SUM(amount)) as points_spent
-      FROM points_transactions
-      WHERE type = 'USAGE'
-      GROUP BY feature
-    `).all();
+    const subscriptionsCount = (db.prepare("SELECT COUNT(*) as count FROM subscriptions WHERE status = 'ACTIVE'").get() as any).count;
+    const totalRevenueCents = (db.prepare("SELECT COALESCE(SUM(amount), 0) as sum FROM payments WHERE status = 'SUCCEEDED'").get() as any).sum;
+
+    const activeJobs = (db.prepare("SELECT COUNT(*) as count FROM jobs WHERE status IN ('QUEUED', 'PROCESSING')").get() as any).count;
+    const failedJobs = (db.prepare("SELECT COUNT(*) as count FROM jobs WHERE status = 'FAILED'").get() as any).count;
+    const completedJobs = (db.prepare("SELECT COUNT(*) as count FROM jobs WHERE status = 'COMPLETED'").get() as any).count;
+
+    const recentAuditLogs = db.prepare("SELECT * FROM audit_logs ORDER BY created_at DESC LIMIT 10").all();
+    const maintenance = getSystemSetting("maintenance", { enabled: false, message: "" });
+    const featureFlags = getSystemSetting("feature_flags", {});
+
+    const memoryUsage = process.memoryUsage();
+    const systemInfo = {
+      platform: process.platform,
+      nodeVersion: process.version,
+      uptimeSeconds: Math.floor(process.uptime()),
+      memoryRssMb: Math.round(memoryUsage.rss / 1024 / 1024),
+      memoryHeapUsedMb: Math.round(memoryUsage.heapUsed / 1024 / 1024),
+      storageMb: Math.round(totalStorageBytes / 1024 / 1024 * 10) / 10,
+      databaseType: "SQLite WAL (Transaccional Nativo)",
+      version: "GREY IA v2.4 Enterprise",
+    };
 
     res.json({
       metrics: {
         totalUsers,
         activeUsers,
         suspendedUsers,
+        ownersCount,
+        superAdminsCount,
+        adminsCount,
         totalProjects,
+        totalAssets,
+        totalStorageBytes,
         totalGenerations,
         totalPointsConsumed,
-        totalAssets,
+        totalPointsPurchased,
         subscriptionsCount,
+        totalRevenueCents,
+        activeJobs,
+        failedJobs,
+        completedJobs,
       },
-      featureBreakdown,
       apiStatus: getApiStatusSummary(),
+      maintenance,
+      featureFlags,
+      systemInfo,
+      configuredOwnerEmail: CONFIGURED_OWNER_EMAIL,
+      isCallerOwner: req.user!.role === "OWNER",
+      recentAuditLogs,
     });
   } catch (err: any) {
-    console.error("Admin stats error:", err);
-    res.status(500).json({ error: "Error al calcular estadísticas del sistema." });
+    console.error("Admin overview error:", err);
+    res.status(500).json({ error: "Error al calcular el resumen de métricas del sistema." });
   }
 });
 
+// 2. Gestión de Usuarios
 app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
-  const search = req.query.search as string;
-  const roleFilter = req.query.role as string;
+  const search = (req.query.search as string) || "";
+  const roleFilter = (req.query.role as string) || "all";
+  const planFilter = (req.query.plan as string) || "all";
+  const statusFilter = (req.query.status as string) || "all";
+
   let query = `
     SELECT id, email, name, role, points, plan, status, verified, created_at, updated_at,
       (SELECT COUNT(*) FROM projects WHERE user_id = users.id) as projects_count,
@@ -1450,6 +1647,7 @@ app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
     WHERE 1=1
   `;
   const params: any[] = [];
+
   if (search) {
     query += " AND (email LIKE ? OR name LIKE ?)";
     params.push(`%${search}%`, `%${search}%`);
@@ -1458,15 +1656,23 @@ app.get("/api/admin/users", requireAuth, requireAdmin, (req, res) => {
     query += " AND role = ?";
     params.push(roleFilter);
   }
-  query += " ORDER BY created_at DESC LIMIT 100";
+  if (planFilter && planFilter !== "all") {
+    query += " AND plan = ?";
+    params.push(planFilter);
+  }
+  if (statusFilter && statusFilter !== "all") {
+    query += " AND status = ?";
+    params.push(statusFilter);
+  }
 
+  query += " ORDER BY created_at DESC LIMIT 150";
   const users = db.prepare(query).all(...params);
   res.json({ users });
 });
 
 app.patch("/api/admin/users/:id", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
-  const { status, role, pointsAdjustment } = req.body;
   const targetId = req.params.id;
+  const { status, role, plan, pointsAdjustment, pointsAdjustmentReason, newPassword } = req.body;
 
   const targetUser = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId) as any;
   if (!targetUser) {
@@ -1474,50 +1680,802 @@ app.patch("/api/admin/users/:id", requireAuth, requireAdmin, (req: Authenticated
     return;
   }
 
-  // Prevent admin from removing their own admin privileges by mistake
-  if (targetId === req.user!.id && role && role !== "ADMIN") {
-    res.status(400).json({ error: "No puedes revocar tu propio rol de administrador." });
+  // PROTECCIÓN ABSOLUTA DEL OWNER
+  const isTargetOwner = targetUser.role === "OWNER";
+  const isCallerOwner = req.user!.role === "OWNER";
+
+  if (isTargetOwner && !isCallerOwner) {
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "SECURITY_VIOLATION", `users/${targetId}`, "Intento no autorizado de modificar la cuenta del PROPIETARIO (OWNER)", req.ip);
+    res.status(403).json({ error: "Seguridad Crítica: La cuenta del PROPIETARIO (OWNER) está blindada y solo puede ser modificada por el propio Propietario." });
+    return;
+  }
+
+  // Si se intenta modificar el rol del OWNER para degradarlo
+  if (isTargetOwner && role && role !== "OWNER") {
+    res.status(400).json({ error: "No es posible degradar al PROPIETARIO principal de la plataforma." });
+    return;
+  }
+
+  // Si alguien que NO es OWNER intenta asignar el rol OWNER
+  if (role === "OWNER" && !isCallerOwner) {
+    res.status(403).json({ error: "Solo el Propietario actual puede transferir o asignar privilegios de OWNER." });
+    return;
+  }
+
+  // Solo OWNER o SUPER_ADMIN pueden asignar roles administrativos
+  if ((role === "SUPER_ADMIN" || role === "ADMIN") && req.user!.role !== "OWNER" && req.user!.role !== "SUPER_ADMIN") {
+    res.status(403).json({ error: "Se requieren privilegios de Propietario o Super Administrador para ascender a otros administradores." });
     return;
   }
 
   const now = new Date().toISOString();
+
   if (status && (status === "ACTIVE" || status === "SUSPENDED")) {
+    if (isTargetOwner && status === "SUSPENDED") {
+      res.status(400).json({ error: "No se puede suspender la cuenta del PROPIETARIO de la plataforma." });
+      return;
+    }
     db.prepare("UPDATE users SET status = ?, updated_at = ? WHERE id = ?").run(status, now, targetId);
-    logSystem("INFO", "ADMIN", `Estado de usuario ${targetUser.email} cambiado a ${status} por ${req.user!.email}`);
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_STATUS_CHANGE", `users/${targetId}`, `Estado cambiado a ${status} para ${targetUser.email}`, req.ip);
   }
 
-  if (role && (role === "USER" || role === "CREATOR" || role === "ADMIN")) {
+  if (role && ["USER", "CREATOR", "ADMIN", "SUPER_ADMIN", "OWNER"].includes(role)) {
     db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").run(role, now, targetId);
-    logSystem("INFO", "ADMIN", `Rol de usuario ${targetUser.email} cambiado a ${role} por ${req.user!.email}`);
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_ROLE_CHANGE", `users/${targetId}`, `Rol de ${targetUser.email} actualizado a ${role}`, req.ip);
+  }
+
+  if (plan && ["FREE", "STARTER", "CREATOR", "PRO", "ULTRA", "ENTERPRISE"].includes(plan.toUpperCase())) {
+    db.prepare("UPDATE users SET plan = ?, updated_at = ? WHERE id = ?").run(plan.toUpperCase(), now, targetId);
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_PLAN_CHANGE", `users/${targetId}`, `Plan de ${targetUser.email} cambiado a ${plan}`, req.ip);
   }
 
   if (typeof pointsAdjustment === "number" && pointsAdjustment !== 0) {
     db.prepare("UPDATE users SET points = MAX(0, points + ?), updated_at = ? WHERE id = ?").run(pointsAdjustment, now, targetId);
     const txId = crypto.randomUUID();
+    const reasonText = pointsAdjustmentReason || "Ajuste manual de créditos desde el panel de control";
     db.prepare(`
       INSERT INTO points_transactions (id, user_id, amount, type, feature, description, created_at)
-      VALUES (?, ?, ?, 'ADMIN_ADJUSTMENT', 'admin', 'Ajuste manual de créditos por administración', ?)
-    `).run(txId, targetId, pointsAdjustment, now);
-    logSystem("INFO", "ADMIN", `Ajuste de puntos a ${targetUser.email}: ${pointsAdjustment > 0 ? "+" : ""}${pointsAdjustment}`);
+      VALUES (?, ?, ?, 'ADMIN_ADJUSTMENT', 'admin_adjustment', ?, ?)
+    `).run(txId, targetId, pointsAdjustment, reasonText, now);
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_POINTS_ADJUSTMENT", `users/${targetId}`, `Ajuste de créditos: ${pointsAdjustment > 0 ? "+" : ""}${pointsAdjustment} a ${targetUser.email}. Motivo: ${reasonText}`, req.ip);
   }
 
-  res.json({ message: "Usuario actualizado por administración." });
+  if (newPassword && newPassword.length >= 6) {
+    const { hash, salt } = hashPassword(newPassword);
+    db.prepare("UPDATE users SET password_hash = ?, salt = ?, updated_at = ? WHERE id = ?").run(hash, salt, now, targetId);
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_PASSWORD_RESET", `users/${targetId}`, `Contraseña restablecida administrativamente para ${targetUser.email}`, req.ip);
+  }
+
+  res.json({ success: true, message: `Usuario ${targetUser.email} actualizado correctamente por administración.` });
 });
 
 app.delete("/api/admin/users/:id", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
   const targetId = req.params.id;
-  if (targetId === req.user!.id) {
-    res.status(400).json({ error: "No puedes eliminar tu propia cuenta de administrador desde este panel." });
-    return;
-  }
-  const user = db.prepare("SELECT email FROM users WHERE id = ?").get(targetId) as any;
-  if (!user) {
+  const targetUser = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId) as any;
+
+  if (!targetUser) {
     res.status(404).json({ error: "Usuario no encontrado." });
     return;
   }
+
+  if (targetUser.role === "OWNER") {
+    res.status(403).json({ error: "Violación de Seguridad: La cuenta del PROPIETARIO (OWNER) está blindada contra eliminación." });
+    return;
+  }
+
+  if (targetId === req.user!.id) {
+    res.status(400).json({ error: "No puedes auto-eliminar tu propia cuenta de administrador en sesión." });
+    return;
+  }
+
+  // Eliminar sesiones y usuario
+  db.prepare("DELETE FROM sessions WHERE user_id = ?").run(targetId);
   db.prepare("DELETE FROM users WHERE id = ?").run(targetId);
-  logSystem("WARN", "ADMIN", `Usuario eliminado por administrador: ${user.email}`);
-  res.json({ message: `Usuario ${user.email} eliminado definitivamente.` });
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "USER_DELETE", `users/${targetId}`, `Usuario ${targetUser.email} (${targetUser.role}) eliminado definitivamente`, req.ip);
+  res.json({ success: true, message: `Usuario ${targetUser.email} eliminado definitivamente del sistema.` });
+});
+
+// 3. Gestión de Administradores & Permisos Granulares
+app.get("/api/admin/administrators", requireAuth, requireAdmin, (_req, res) => {
+  const admins = db.prepare(`
+    SELECT id, email, name, role, plan, status, created_at, updated_at
+    FROM users
+    WHERE role IN ('OWNER', 'SUPER_ADMIN', 'ADMIN')
+    ORDER BY CASE role WHEN 'OWNER' THEN 1 WHEN 'SUPER_ADMIN' THEN 2 ELSE 3 END, created_at ASC
+  `).all();
+
+  const permissions = db.prepare("SELECT user_id, permission FROM admin_permissions").all() as any[];
+  const permMap: Record<string, string[]> = {};
+  for (const p of permissions) {
+    if (!permMap[p.user_id]) permMap[p.user_id] = [];
+    permMap[p.user_id].push(p.permission);
+  }
+
+  const result = admins.map((adm: any) => ({
+    ...adm,
+    permissions: permMap[adm.id] || [],
+  }));
+
+  res.json({ administrators: result });
+});
+
+app.post("/api/admin/administrators", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { email, role = "ADMIN", permissions = [] } = req.body;
+  if (!email) {
+    res.status(400).json({ error: "Debe proporcionar el correo del usuario a promover." });
+    return;
+  }
+
+  const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email.toLowerCase().trim()) as any;
+  if (!user) {
+    res.status(404).json({ error: `No existe ningún usuario registrado con el correo ${email}.` });
+    return;
+  }
+
+  if (role === "SUPER_ADMIN" && req.user!.role !== "OWNER") {
+    res.status(403).json({ error: "Solo el PROPIETARIO (OWNER) puede nombrar nuevos SUPER ADMINISTRADORES." });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare("UPDATE users SET role = ?, updated_at = ? WHERE id = ?").run(role, now, user.id);
+
+  // Guardar permisos
+  db.prepare("DELETE FROM admin_permissions WHERE user_id = ?").run(user.id);
+  if (Array.isArray(permissions)) {
+    const insertPerm = db.prepare("INSERT INTO admin_permissions (id, user_id, permission, granted_at, granted_by) VALUES (?, ?, ?, ?, ?)");
+    for (const perm of permissions) {
+      insertPerm.run(crypto.randomUUID(), user.id, perm, now, req.user!.email);
+    }
+  }
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "ADMIN_ROLE_PROMOTED", `users/${user.id}`, `Usuario ${user.email} promovido a ${role} con ${permissions.length} permisos`, req.ip);
+  res.json({ success: true, message: `Usuario ${user.email} promovido a ${role} con éxito.` });
+});
+
+app.patch("/api/admin/administrators/:id/permissions", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const targetId = req.params.id;
+  const { permissions = [] } = req.body;
+
+  const target = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId) as any;
+  if (!target) {
+    res.status(404).json({ error: "Administrador no encontrado." });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare("DELETE FROM admin_permissions WHERE user_id = ?").run(targetId);
+  const insertPerm = db.prepare("INSERT INTO admin_permissions (id, user_id, permission, granted_at, granted_by) VALUES (?, ?, ?, ?, ?)");
+  for (const perm of permissions) {
+    insertPerm.run(crypto.randomUUID(), targetId, perm, now, req.user!.email);
+  }
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "ADMIN_PERMISSIONS_UPDATE", `users/${targetId}`, `Permisos actualizados para ${target.email}`, req.ip);
+  res.json({ success: true, message: "Permisos de administración actualizados correctamente." });
+});
+
+app.delete("/api/admin/administrators/:id", requireAuth, requireOwner, (req: AuthenticatedRequest, res) => {
+  const targetId = req.params.id;
+  const target = db.prepare("SELECT * FROM users WHERE id = ?").get(targetId) as any;
+  if (!target) {
+    res.status(404).json({ error: "Administrador no encontrado." });
+    return;
+  }
+  if (target.role === "OWNER") {
+    res.status(400).json({ error: "No es posible revocar privilegios al PROPIETARIO (OWNER)." });
+    return;
+  }
+
+  const now = new Date().toISOString();
+  db.prepare("UPDATE users SET role = 'USER', updated_at = ? WHERE id = ?").run(now, targetId);
+  db.prepare("DELETE FROM admin_permissions WHERE user_id = ?").run(targetId);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "ADMIN_REVOKED", `users/${targetId}`, `Privilegios administrativos revocados a ${target.email}`, req.ip);
+  res.json({ success: true, message: `Privilegios administrativos de ${target.email} revocados. Ahora es usuario estándar.` });
+});
+
+// 4. Editor Visual de Diseño (Borrador vs Publicado)
+app.get("/api/admin/design", requireAuth, requireAdmin, (_req, res) => {
+  const published = getSystemSetting("design_published", {
+    platform_title: "GREY IA",
+    tagline: "Tu herramienta definitiva de Inteligencia Artificial",
+    hero_title: "¡Hola! 👋",
+    hero_subtitle: "¿Qué vamos a crear hoy?",
+    announcement_banner: "",
+    banner_active: false,
+    footer_text: "GREY IA — Plataforma Autónoma de Producción Audiovisual con Inteligencia Artificial.",
+    login_header: "Bienvenido al Núcleo",
+    login_subtitle: "Inicia sesión para acceder a tus proyectos y motores de IA",
+    status: "published",
+  });
+  const draft = getSystemSetting("design_draft", published);
+
+  res.json({ published, draft });
+});
+
+app.post("/api/admin/design/draft", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const draftConfig = req.body;
+  setSystemSetting("design_draft", { ...draftConfig, status: "draft" }, "design", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "DESIGN_DRAFT_SAVED", "settings/design", "Borrador de diseño actualizado para previsualización", req.ip);
+  res.json({ success: true, message: "Borrador de diseño guardado para previsualización." });
+});
+
+app.post("/api/admin/design/publish", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const draft = getSystemSetting("design_draft", null);
+  if (!draft) {
+    res.status(400).json({ error: "No hay ningún borrador de diseño para publicar." });
+    return;
+  }
+  const published = { ...draft, status: "published", published_at: new Date().toISOString(), published_by: req.user!.email };
+  setSystemSetting("design_published", published, "design", req.user!.email);
+  setSystemSetting("design_draft", published, "design", req.user!.email);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "DESIGN_PUBLISHED", "settings/design", "Diseño visual publicado en producción para todos los usuarios", req.ip);
+  res.json({ success: true, message: "¡Diseño visual publicado exitosamente en producción!", published });
+});
+
+app.post("/api/admin/design/reset", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const published = getSystemSetting("design_published", {});
+  setSystemSetting("design_draft", published, "design", req.user!.email);
+  res.json({ success: true, message: "Borrador restablecido a la versión pública actual.", draft: published });
+});
+
+// 5. Gestor de Contenidos & Avisos
+app.get("/api/admin/content", requireAuth, requireAdmin, (_req, res) => {
+  const pages = db.prepare("SELECT * FROM content_pages ORDER BY slug ASC").all();
+  res.json({ pages });
+});
+
+app.put("/api/admin/content/:slug", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const { title, content, is_published = 1 } = req.body;
+  const slug = req.params.slug;
+  const now = new Date().toISOString();
+
+  const existing = db.prepare("SELECT id FROM content_pages WHERE slug = ?").get(slug);
+  if (existing) {
+    db.prepare("UPDATE content_pages SET title = ?, content = ?, is_published = ?, updated_at = ?, updated_by = ? WHERE slug = ?")
+      .run(title, content, is_published ? 1 : 0, now, req.user!.email, slug);
+  } else {
+    db.prepare("INSERT INTO content_pages (id, slug, title, content, is_published, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?)")
+      .run(crypto.randomUUID(), slug, title, content, is_published ? 1 : 0, now, req.user!.email);
+  }
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "CONTENT_PAGE_UPDATE", `content_pages/${slug}`, `Página o aviso '${slug}' actualizado`, req.ip);
+  res.json({ success: true, message: `Contenido de '${slug}' guardado exitosamente.` });
+});
+
+// 6. Herramientas IA & Feature Flags
+app.get("/api/admin/tools", requireAuth, requireAdmin, (_req, res) => {
+  const tools = getSystemSetting("tools_config", []);
+  const featureFlags = getSystemSetting("feature_flags", {});
+  res.json({ tools, featureFlags });
+});
+
+app.put("/api/admin/tools/:id", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const toolId = req.params.id;
+  const { enabled, points_cost, provider, model, priority } = req.body;
+  const tools = getSystemSetting<any[]>("tools_config", []);
+
+  const idx = tools.findIndex((t) => t.id === toolId);
+  if (idx === -1) {
+    res.status(404).json({ error: "Herramienta no encontrada." });
+    return;
+  }
+
+  tools[idx] = {
+    ...tools[idx],
+    enabled: typeof enabled === "boolean" ? enabled : tools[idx].enabled,
+    points_cost: typeof points_cost === "number" ? points_cost : tools[idx].points_cost,
+    provider: provider || tools[idx].provider,
+    model: model || tools[idx].model,
+    priority: typeof priority === "number" ? priority : tools[idx].priority,
+  };
+
+  setSystemSetting("tools_config", tools, "ai", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "TOOL_CONFIG_UPDATE", `tools/${toolId}`, `Herramienta ${toolId} configurada: activa=${enabled}, coste=${points_cost}`, req.ip);
+  res.json({ success: true, message: `Herramienta '${tools[idx].name}' actualizada.`, tools });
+});
+
+app.post("/api/admin/tools/feature-flags", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const flags = req.body;
+  const current = getSystemSetting("feature_flags", {});
+  const updated = { ...current, ...flags };
+  setSystemSetting("feature_flags", updated, "features", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "FEATURE_FLAGS_UPDATE", "settings/feature_flags", "Feature flags globales actualizados", req.ip);
+  res.json({ success: true, message: "Feature flags actualizados correctamente.", featureFlags: updated });
+});
+
+// 7. Configuración IA & Fallback
+app.get("/api/admin/ai-config", requireAuth, requireAdmin, (_req, res) => {
+  const aiProviders = getSystemSetting("ai_providers", {});
+  const statusSummary = getApiStatusSummary();
+
+  res.json({
+    summary: statusSummary,
+    config: aiProviders,
+    providers: [
+      { id: "gemini", name: "Google Gemini (Flash & Pro)", configured: isGeminiConfigured(), activeModel: aiProviders?.gemini?.model || "gemini-3.8-flash", keyMasked: isGeminiConfigured() ? "AIzaSy•••••••••••••••" : null },
+      { id: "veo", name: "Google Veo (Vídeo)", configured: isGeminiConfigured(), activeModel: aiProviders?.veo?.model || "veo-3.1-lite-generate-preview", keyMasked: isGeminiConfigured() ? "AIzaSy•••••••••••••••" : null },
+      { id: "runway", name: "Runway Gen-3 Alpha", configured: isRunwayConfigured(), activeModel: "gen-3-alpha", keyMasked: isRunwayConfigured() ? "runway_•••••••••••••" : null },
+      { id: "elevenlabs", name: "ElevenLabs Voice AI", configured: isElevenLabsConfigured(), activeModel: "eleven_multilingual_v2", keyMasked: isElevenLabsConfigured() ? "xi_••••••••••••••••" : null },
+      { id: "openai", name: "OpenAI GPT-4o", configured: Boolean(process.env.OPENAI_API_KEY), activeModel: "gpt-4o", keyMasked: process.env.OPENAI_API_KEY ? "sk-proj-•••••••••••••" : null },
+      { id: "stripe", name: "Stripe Payments", configured: isStripeConfigured(), activeModel: "PCI Service", keyMasked: isStripeConfigured() ? "sk_live_••••••••••••" : null },
+    ],
+  });
+});
+
+app.put("/api/admin/ai-config", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const newConfig = req.body;
+  const current = getSystemSetting("ai_providers", {});
+  const updated = { ...current, ...newConfig };
+  setSystemSetting("ai_providers", updated, "ai", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "AI_CONFIG_UPDATE", "settings/ai_providers", "Cadena de fallback y parámetros de IA actualizados", req.ip);
+  res.json({ success: true, message: "Configuración de modelos de IA y cadena de fallback guardada.", config: updated });
+});
+
+app.post("/api/admin/ai-config/test", requireAuth, requireAdmin, async (req: AuthenticatedRequest, res) => {
+  const { provider = "gemini" } = req.body;
+  try {
+    if (provider === "gemini") {
+      if (!isGeminiConfigured()) {
+        res.status(400).json({ success: false, error: "GEMINI_API_KEY no está configurada en las variables de entorno del servidor." });
+        return;
+      }
+      const ai = getGeminiClient();
+      const response = await ai.models.generateContent({
+        model: "gemini-3.8-flash",
+        contents: "Responde únicamente 'OK GREY IA' para probar la conexión.",
+      });
+      res.json({ success: true, message: `Conexión exitosa con Google Gemini: ${response.text?.trim()}` });
+      return;
+    }
+
+    if (provider === "elevenlabs") {
+      if (!isElevenLabsConfigured()) {
+        res.status(400).json({ success: false, error: "ELEVENLABS_API_KEY no configurada." });
+        return;
+      }
+      res.json({ success: true, message: "ElevenLabs API Key detectada y lista para llamadas de síntesis vocal." });
+      return;
+    }
+
+    if (provider === "runway") {
+      if (!isRunwayConfigured()) {
+        res.status(400).json({ success: false, error: "RUNWAY_API_KEY no configurada." });
+        return;
+      }
+      res.json({ success: true, message: "Runway Gen-3 API Key detectada en el servidor." });
+      return;
+    }
+
+    res.json({ success: true, message: `Proveedor ${provider} verificado.` });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: `Fallo al verificar proveedor: ${err.message}` });
+  }
+});
+
+// 8. Economía de Puntos & Paquetes
+app.get("/api/admin/points", requireAuth, requireAdmin, (_req, res) => {
+  const general = getSystemSetting("general", { welcome_points: 12560 });
+  const packages = db.prepare("SELECT * FROM points_packages ORDER BY sort_order ASC").all();
+  const transactions = db.prepare(`
+    SELECT pt.*, u.email as user_email, u.name as user_name
+    FROM points_transactions pt
+    JOIN users u ON pt.user_id = u.id
+    ORDER BY pt.created_at DESC
+    LIMIT 100
+  `).all();
+
+  res.json({
+    welcomePoints: general.welcome_points,
+    packages,
+    transactions,
+  });
+});
+
+app.put("/api/admin/points/welcome", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { welcomePoints } = req.body;
+  if (typeof welcomePoints !== "number" || welcomePoints < 0) {
+    res.status(400).json({ error: "Cantidad de créditos iniciales inválida." });
+    return;
+  }
+  const general = getSystemSetting("general", {});
+  setSystemSetting("general", { ...general, welcome_points: welcomePoints }, "general", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "WELCOME_POINTS_UPDATE", "settings/general", `Créditos de bienvenida cambiados a ${welcomePoints}`, req.ip);
+  res.json({ success: true, message: `Créditos de bienvenida actualizados a ${welcomePoints} créditos.` });
+});
+
+app.post("/api/admin/points/packages", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { id, name, points, price, bonus_points = 0, is_active = 1, is_popular = 0, sort_order = 0 } = req.body;
+  if (!name || typeof points !== "number" || typeof price !== "number") {
+    res.status(400).json({ error: "Datos del paquete incompletos." });
+    return;
+  }
+  const pkgId = id || `pkg-${Date.now()}`;
+  db.prepare(`
+    INSERT INTO points_packages (id, name, points, price, bonus_points, is_active, is_popular, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      name = excluded.name,
+      points = excluded.points,
+      price = excluded.price,
+      bonus_points = excluded.bonus_points,
+      is_active = excluded.is_active,
+      is_popular = excluded.is_popular,
+      sort_order = excluded.sort_order
+  `).run(pkgId, name, points, price, bonus_points, is_active, is_popular, sort_order);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "POINTS_PACKAGE_SAVED", `points_packages/${pkgId}`, `Paquete de puntos '${name}' (${points} pts, ${price}€) guardado`, req.ip);
+  res.json({ success: true, message: "Paquete de créditos guardado correctamente." });
+});
+
+app.delete("/api/admin/points/packages/:id", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  db.prepare("DELETE FROM points_packages WHERE id = ?").run(req.params.id);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "POINTS_PACKAGE_DELETE", `points_packages/${req.params.id}`, "Paquete de puntos eliminado", req.ip);
+  res.json({ success: true, message: "Paquete de créditos eliminado." });
+});
+
+// 9. Planes & Suscripciones
+app.get("/api/admin/plans", requireAuth, requireAdmin, (_req, res) => {
+  const plans = db.prepare("SELECT * FROM plans_config ORDER BY sort_order ASC").all();
+  res.json({ plans });
+});
+
+app.put("/api/admin/plans/:code", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const code = req.params.code.toUpperCase();
+  const { name, price_monthly, points_monthly, max_resolution, features, is_active } = req.body;
+
+  db.prepare(`
+    UPDATE plans_config
+    SET name = COALESCE(?, name),
+        price_monthly = COALESCE(?, price_monthly),
+        points_monthly = COALESCE(?, points_monthly),
+        max_resolution = COALESCE(?, max_resolution),
+        features = COALESCE(?, features),
+        is_active = COALESCE(?, is_active)
+    WHERE code = ?
+  `).run(name, price_monthly, points_monthly, max_resolution, features, is_active, code);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "PLAN_CONFIG_UPDATE", `plans/${code}`, `Plan ${code} actualizado: ${price_monthly}€, ${points_monthly} pts`, req.ip);
+  res.json({ success: true, message: `Plan '${code}' actualizado exitosamente.` });
+});
+
+// 10. Pagos & Transacciones
+app.get("/api/admin/payments", requireAuth, requireAdmin, (_req, res) => {
+  const payments = db.prepare(`
+    SELECT p.*, u.email as user_email, u.name as user_name
+    FROM payments p
+    LEFT JOIN users u ON p.user_id = u.id
+    ORDER BY p.created_at DESC
+    LIMIT 100
+  `).all();
+  res.json({ payments, stripeConfigured: isStripeConfigured() });
+});
+
+// 11. Proyectos & Biblioteca de Archivos Global
+app.get("/api/admin/projects", requireAuth, requireAdmin, (req, res) => {
+  const search = (req.query.search as string) || "";
+  let query = `
+    SELECT p.id, p.title, p.aspect_ratio, p.duration, p.thumbnail, p.created_at, p.updated_at,
+           u.email as owner_email, u.name as owner_name
+    FROM projects p
+    JOIN users u ON p.user_id = u.id
+    WHERE 1=1
+  `;
+  const params: any[] = [];
+  if (search) {
+    query += " AND (p.title LIKE ? OR u.email LIKE ?)";
+    params.push(`%${search}%`, `%${search}%`);
+  }
+  query += " ORDER BY p.created_at DESC LIMIT 100";
+  const projects = db.prepare(query).all(...params);
+  res.json({ projects });
+});
+
+app.delete("/api/admin/projects/:id", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const project = db.prepare("SELECT title FROM projects WHERE id = ?").get(req.params.id) as any;
+  db.prepare("DELETE FROM projects WHERE id = ?").run(req.params.id);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "PROJECT_ADMIN_DELETE", `projects/${req.params.id}`, `Proyecto '${project?.title || req.params.id}' eliminado administrativamente`, req.ip);
+  res.json({ success: true, message: "Proyecto eliminado del sistema." });
+});
+
+app.get("/api/admin/library", requireAuth, requireAdmin, (req, res) => {
+  const search = (req.query.search as string) || "";
+  const typeFilter = (req.query.type as string) || "all";
+
+  let query = `
+    SELECT la.*, u.email as owner_email, u.name as owner_name
+    FROM library_assets la
+    JOIN users u ON la.user_id = u.id
+    WHERE 1=1
+  `;
+  const params: any[] = [];
+  if (search) {
+    query += " AND (la.name LIKE ? OR u.email LIKE ?)";
+    params.push(`%${search}%`, `%${search}%`);
+  }
+  if (typeFilter && typeFilter !== "all") {
+    query += " AND la.type = ?";
+    params.push(typeFilter);
+  }
+  query += " ORDER BY la.created_at DESC LIMIT 150";
+  const assets = db.prepare(query).all(...params);
+
+  const stats = db.prepare(`
+    SELECT type, COUNT(*) as count, COALESCE(SUM(size), 0) as total_bytes
+    FROM library_assets
+    GROUP BY type
+  `).all();
+
+  res.json({ assets, stats });
+});
+
+app.delete("/api/admin/library/:id", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const asset = db.prepare("SELECT * FROM library_assets WHERE id = ?").get(req.params.id) as any;
+  if (asset && asset.url && asset.url.startsWith("/uploads/")) {
+    const filename = path.basename(asset.url);
+    const fullPath = path.join(UPLOADS_DIR, filename);
+    if (fs.existsSync(fullPath)) {
+      try {
+        fs.unlinkSync(fullPath);
+      } catch {}
+    }
+  }
+  db.prepare("DELETE FROM library_assets WHERE id = ?").run(req.params.id);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "ASSET_ADMIN_DELETE", `library_assets/${req.params.id}`, `Recurso '${asset?.name}' eliminado por administración`, req.ip);
+  res.json({ success: true, message: "Recurso eliminado de la biblioteca global." });
+});
+
+// 12. Gestor de Plantillas
+app.get("/api/admin/templates", requireAuth, requireAdmin, (_req, res) => {
+  const templates = db.prepare("SELECT * FROM templates ORDER BY created_at DESC").all();
+  res.json({ templates });
+});
+
+app.post("/api/admin/templates", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  const { title, category, description, thumbnail, aspect_ratio = "9:16", data = "{}" } = req.body;
+  if (!title || !category) {
+    res.status(400).json({ error: "Título y categoría son requeridos para la plantilla." });
+    return;
+  }
+  const id = crypto.randomUUID();
+  const now = new Date().toISOString();
+  db.prepare(`
+    INSERT INTO templates (id, title, category, description, thumbnail, aspect_ratio, data, is_active, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+  `).run(id, title, category, description || "", thumbnail || "", aspect_ratio, typeof data === "object" ? JSON.stringify(data) : data, now, now);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "TEMPLATE_CREATE", `templates/${id}`, `Plantilla '${title}' creada`, req.ip);
+  res.json({ success: true, message: "Plantilla creada correctamente.", id });
+});
+
+app.delete("/api/admin/templates/:id", requireAuth, requireAdmin, (req: AuthenticatedRequest, res) => {
+  db.prepare("DELETE FROM templates WHERE id = ?").run(req.params.id);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "TEMPLATE_DELETE", `templates/${req.params.id}`, "Plantilla eliminada", req.ip);
+  res.json({ success: true, message: "Plantilla eliminada." });
+});
+
+// 13. Notificaciones & Email
+app.post("/api/admin/notifications/broadcast", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { title, message, type = "info", link = "", targetRole = "ALL" } = req.body;
+  if (!title || !message) {
+    res.status(400).json({ error: "Título y mensaje de notificación son requeridos." });
+    return;
+  }
+
+  let usersQuery = "SELECT id FROM users WHERE status = 'ACTIVE'";
+  const params: any[] = [];
+  if (targetRole && targetRole !== "ALL") {
+    usersQuery += " AND role = ?";
+    params.push(targetRole);
+  }
+
+  const users = db.prepare(usersQuery).all(...params) as any[];
+  const now = new Date().toISOString();
+  const stmt = db.prepare("INSERT INTO notifications (id, user_id, title, message, type, is_read, link, created_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)");
+
+  for (const u of users) {
+    stmt.run(crypto.randomUUID(), u.id, title, message, type, link, now);
+  }
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "NOTIFICATION_BROADCAST", "notifications", `Aviso masivo enviado a ${users.length} usuarios: "${title}"`, req.ip);
+  res.json({ success: true, message: `Notificación emitida a ${users.length} usuarios activos.` });
+});
+
+app.get("/api/admin/email", requireAuth, requireAdmin, (_req, res) => {
+  const emailConfig = getSystemSetting("email_config", {
+    sender_name: "GREY IA Equipo",
+    sender_email: "soporte@greyia.com",
+    smtp_host: "smtp.sendgrid.net",
+    smtp_port: 587,
+    smtp_user: "apikey",
+    is_configured: false,
+    welcome_subject: "¡Bienvenido a GREY IA! Tu cuenta está lista",
+    welcome_body: "Hola {{name}},\n\nTu cuenta en GREY IA ha sido configurada con éxito con 12.560 créditos gratuitos de bienvenida.\n\nAccede a la plataforma para comenzar tus producciones con IA.",
+    reset_subject: "Restablecimiento de contraseña — GREY IA",
+    reset_body: "Hola {{name}},\n\nHas solicitado restablecer tu contraseña. Haz clic en el enlace para continuar.",
+  });
+  res.json({ emailConfig });
+});
+
+app.put("/api/admin/email", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const newConfig = req.body;
+  setSystemSetting("email_config", newConfig, "email", req.user!.email);
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "EMAIL_CONFIG_UPDATE", "settings/email_config", "Configuración de correos del sistema actualizada", req.ip);
+  res.json({ success: true, message: "Configuración de correo y plantillas guardada." });
+});
+
+// 14. Estadísticas Avanzadas & Monitorización
+app.get("/api/admin/stats", requireAuth, requireAdmin, (_req, res) => {
+  try {
+    const dailyGenerations = db.prepare(`
+      SELECT substr(created_at, 1, 10) as date, COUNT(*) as count, ABS(SUM(amount)) as points
+      FROM points_transactions
+      WHERE type = 'USAGE'
+      GROUP BY substr(created_at, 1, 10)
+      ORDER BY date DESC
+      LIMIT 14
+    `).all();
+
+    const featureBreakdown = db.prepare(`
+      SELECT feature, COUNT(*) as count, ABS(SUM(amount)) as points_spent
+      FROM points_transactions
+      WHERE type = 'USAGE'
+      GROUP BY feature
+      ORDER BY points_spent DESC
+    `).all();
+
+    const signupsByDate = db.prepare(`
+      SELECT substr(created_at, 1, 10) as date, COUNT(*) as count
+      FROM users
+      GROUP BY substr(created_at, 1, 10)
+      ORDER BY date DESC
+      LIMIT 14
+    `).all();
+
+    res.json({
+      dailyGenerations,
+      featureBreakdown,
+      signupsByDate,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: "Error calculando analíticas." });
+  }
+});
+
+app.get("/api/admin/monitoring", requireAuth, requireAdmin, async (_req, res) => {
+  const startTime = Date.now();
+  // DB latency check
+  db.prepare("SELECT 1").get();
+  const dbLatencyMs = Date.now() - startTime;
+
+  const errorCount = (db.prepare("SELECT COUNT(*) as count FROM system_logs WHERE level = 'ERROR'").get() as any).count;
+  const recentErrors = db.prepare("SELECT * FROM system_logs WHERE level = 'ERROR' ORDER BY created_at DESC LIMIT 5").all();
+
+  res.json({
+    status: "HEALTHY",
+    timestamp: new Date().toISOString(),
+    dbLatencyMs,
+    errorCount,
+    recentErrors,
+    apiStatus: getApiStatusSummary(),
+    memory: process.memoryUsage(),
+    uptime: process.uptime(),
+  });
+});
+
+// 15. Auditoría & Registros de Seguridad
+app.get("/api/admin/audit-logs", requireAuth, requireAdmin, (req, res) => {
+  const search = (req.query.search as string) || "";
+  const role = (req.query.role as string) || "all";
+
+  let query = "SELECT * FROM audit_logs WHERE 1=1";
+  const params: any[] = [];
+  if (search) {
+    query += " AND (user_email LIKE ? OR action LIKE ? OR resource LIKE ? OR details LIKE ?)";
+    params.push(`%${search}%`, `%${search}%`, `%${search}%`, `%${search}%`);
+  }
+  if (role && role !== "all") {
+    query += " AND role = ?";
+    params.push(role);
+  }
+  query += " ORDER BY created_at DESC LIMIT 200";
+
+  const logs = db.prepare(query).all(...params);
+  res.json({ logs });
+});
+
+// 16. Copias de Seguridad (Exportar / Importar)
+app.get("/api/admin/backups/export", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const settings = db.prepare("SELECT * FROM system_settings").all();
+  const plans = db.prepare("SELECT * FROM plans_config").all();
+  const packages = db.prepare("SELECT * FROM points_packages").all();
+  const content = db.prepare("SELECT * FROM content_pages").all();
+  const templates = db.prepare("SELECT * FROM templates").all();
+
+  const backupData = {
+    version: "GREY IA v2.4 Enterprise",
+    exported_at: new Date().toISOString(),
+    exported_by: req.user!.email,
+    settings,
+    plans,
+    packages,
+    content,
+    templates,
+  };
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "BACKUP_EXPORT", "backups", "Copia de seguridad del sistema exportada", req.ip);
+  res.setHeader("Content-Disposition", `attachment; filename=grey_ia_backup_${Date.now()}.json`);
+  res.setHeader("Content-Type", "application/json");
+  res.send(JSON.stringify(backupData, null, 2));
+});
+
+app.post("/api/admin/backups/import", requireAuth, requireOwner, (req: AuthenticatedRequest, res) => {
+  const backup = req.body;
+  if (!backup || !backup.settings) {
+    res.status(400).json({ error: "Archivo de copia de seguridad inválido o formato incompatible." });
+    return;
+  }
+
+  try {
+    // Importar configuración con transacción
+    if (Array.isArray(backup.settings)) {
+      const stmt = db.prepare("INSERT INTO system_settings (key, value, category, updated_at, updated_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, category = excluded.category, updated_at = excluded.updated_at, updated_by = excluded.updated_by");
+      for (const s of backup.settings) {
+        stmt.run(s.key, s.value, s.category, new Date().toISOString(), req.user!.email);
+      }
+    }
+
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "BACKUP_RESTORE", "backups", "Copia de seguridad restaurada por el PROPIETARIO (OWNER)", req.ip);
+    res.json({ success: true, message: "Configuraciones y datos del sistema restaurados con éxito desde la copia de seguridad." });
+  } catch (err: any) {
+    res.status(500).json({ error: `Fallo al importar copia de seguridad: ${err.message}` });
+  }
+});
+
+app.get("/api/admin/backups/export-users", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const users = db.prepare("SELECT id, email, name, role, points, plan, status, created_at FROM users").all();
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "USERS_EXPORT", "users", `Listado de ${users.length} usuarios exportado`, req.ip);
+  res.json({ users, exported_at: new Date().toISOString() });
+});
+
+// 17. Modo Mantenimiento
+app.get("/api/admin/maintenance", requireAuth, requireAdmin, (_req, res) => {
+  const maintenance = getSystemSetting("maintenance", { enabled: false, message: "" });
+  res.json({ maintenance });
+});
+
+app.post("/api/admin/maintenance", requireAuth, requireSuperAdmin, (req: AuthenticatedRequest, res) => {
+  const { enabled, message } = req.body;
+  const current = getSystemSetting("maintenance", { enabled: false, message: "" });
+  const updated = {
+    enabled: Boolean(enabled),
+    message: message || "GREY IA se encuentra en mantenimiento programado. Volveremos pronto.",
+    updated_at: new Date().toISOString(),
+    updated_by: req.user!.email,
+  };
+  setSystemSetting("maintenance", updated, "system", req.user!.email);
+
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "MAINTENANCE_TOGGLE", "system/maintenance", `Modo mantenimiento ${enabled ? "ACTIVADO" : "DESACTIVADO"}: "${updated.message}"`, req.ip);
+  res.json({ success: true, message: `Modo mantenimiento ${enabled ? "activado" : "desactivado"} con éxito.`, maintenance: updated });
+});
+
+// 18. Seguridad & Re-autenticación de Acciones Críticas
+app.post("/api/admin/security/verify-password", requireAuth, (req: AuthenticatedRequest, res) => {
+  const { password } = req.body;
+  if (!password) {
+    res.status(400).json({ error: "Debe ingresar su contraseña." });
+    return;
+  }
+  const user = db.prepare("SELECT password_hash, salt FROM users WHERE id = ?").get(req.user!.id) as any;
+  if (!user || !verifyPassword(password, user.password_hash, user.salt)) {
+    logAudit(req.user!.id, req.user!.email, req.user!.role, "SECURITY_REAUTH_FAILED", "security", "Contraseña incorrecta en re-autenticación", req.ip);
+    res.status(401).json({ error: "Contraseña incorrecta. Acción cancelada por seguridad." });
+    return;
+  }
+  logAudit(req.user!.id, req.user!.email, req.user!.role, "SECURITY_REAUTH_SUCCESS", "security", "Re-autenticación exitosa para acción sensible", req.ip);
+  res.json({ success: true, message: "Identidad confirmada." });
 });
 
 app.get("/api/admin/logs", requireAuth, requireAdmin, (_req, res) => {
@@ -1525,18 +2483,6 @@ app.get("/api/admin/logs", requireAuth, requireAdmin, (_req, res) => {
   res.json({ logs });
 });
 
-app.get("/api/admin/api-config", requireAuth, requireAdmin, (_req, res) => {
-  res.json({
-    summary: getApiStatusSummary(),
-    envVariables: [
-      { name: "GEMINI_API_KEY", configured: isGeminiConfigured(), description: "Modelos Google Gemini 3.8 Flash, Veo y nano banana" },
-      { name: "RUNWAY_API_KEY", configured: isRunwayConfigured(), description: "Motor de vídeo Runway Gen-3 Alpha" },
-      { name: "ELEVENLABS_API_KEY", configured: isElevenLabsConfigured(), description: "Motor de síntesis vocal hiperrealista ElevenLabs" },
-      { name: "OPENAI_API_KEY", configured: false, description: "Modelos multimodales OpenAI (Opcional)" },
-      { name: "STRIPE_SECRET_KEY", configured: isStripeConfigured(), description: "Procesamiento de pagos y suscripciones bancarias reales" },
-    ],
-  });
-});
 
 // ==========================================
 // VITE INTEGRATION / SPA FALLBACK
@@ -1544,6 +2490,7 @@ app.get("/api/admin/api-config", requireAuth, requireAdmin, (_req, res) => {
 
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
@@ -1551,10 +2498,12 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), "dist");
-    app.use(express.static(distPath));
-    app.get("*", (_req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
+    if (fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (_req, res) => {
+        res.sendFile(path.join(distPath, "index.html"));
+      });
+    }
   }
 
   app.listen(PORT, "0.0.0.0", () => {
@@ -1562,4 +2511,9 @@ async function startServer() {
   });
 }
 
-startServer();
+// Only run standalone listener when not in a serverless environment (Vercel)
+if (!process.env.VERCEL) {
+  startServer();
+}
+
+export default app;

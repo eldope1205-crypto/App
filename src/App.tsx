@@ -30,14 +30,39 @@ const AppContent: React.FC = () => {
   const [authView, setAuthView] = useState<'login' | 'register' | 'recover'>('login');
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(false);
 
-  // Sync with URL query parameter
+  // Sync with URL query parameter & pathname
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const viewParam = params.get('view');
-    if (viewParam) {
-      setCurrentView(viewParam);
-    }
+    const syncFromUrl = () => {
+      const params = new URLSearchParams(window.location.search);
+      const viewParam = params.get('view');
+      const pathname = window.location.pathname.toLowerCase().replace(/\/$/, '');
+
+      if (viewParam === 'register' || pathname.endsWith('/register')) {
+        setAuthView('register');
+      } else if (viewParam === 'recover' || pathname.endsWith('/recover')) {
+        setAuthView('recover');
+      } else if (viewParam === 'login' || pathname.endsWith('/login')) {
+        setAuthView('login');
+      } else if (viewParam) {
+        setCurrentView(viewParam);
+      } else if (pathname && pathname !== '/') {
+        const cleanPath = pathname.replace(/^\//, '');
+        if (cleanPath) setCurrentView(cleanPath);
+      }
+    };
+
+    syncFromUrl();
+    window.addEventListener('popstate', syncFromUrl);
+    return () => window.removeEventListener('popstate', syncFromUrl);
   }, []);
+
+  const handleAuthNavigate = (view: 'login' | 'register' | 'recover' | string) => {
+    const target = (view === 'register' || view === 'recover' || view === 'login') ? view : 'login';
+    setAuthView(target);
+    const url = new URL(window.location.href);
+    url.search = `view=${target}`;
+    window.history.pushState({}, '', url.toString());
+  };
 
   const handleNavigate = (view: string) => {
     // If view contains query string like `editor-video?id=xyz`
@@ -72,12 +97,12 @@ const AppContent: React.FC = () => {
   // Unauthenticated user -> Auth screens
   if (!user) {
     if (authView === 'register') {
-      return <RegisterView onNavigate={setAuthView} />;
+      return <RegisterView onNavigate={handleAuthNavigate} />;
     }
     if (authView === 'recover') {
-      return <RecoverPasswordView onNavigate={setAuthView} />;
+      return <RecoverPasswordView onNavigate={handleAuthNavigate} />;
     }
-    return <LoginView onNavigate={setAuthView} />;
+    return <LoginView onNavigate={handleAuthNavigate} initialMode={authView} />;
   }
 
   // Authenticated user -> Application Shell

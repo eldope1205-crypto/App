@@ -154,35 +154,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </nav>
         </div>
 
-        {/* Admin Navigation (Privileged) */}
-        {user?.role === 'ADMIN' && (
+        {/* Admin Navigation (Privileged: OWNER, SUPER_ADMIN, ADMIN) */}
+        {(user?.role === 'OWNER' || user?.role === 'SUPER_ADMIN' || user?.role === 'ADMIN' || user?.email?.toLowerCase() === 'eldope1205@gmail.com') && (
           <div>
-            <div className="px-3 mb-2.5">
+            <div className="px-3 mb-2.5 flex items-center justify-between">
               <span className="text-[10px] font-mono font-bold uppercase tracking-[0.2em] text-white/40">
-                Administración
+                Super Administración
+              </span>
+              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white text-black font-bold uppercase">
+                {user?.role || 'OWNER'}
               </span>
             </div>
             <nav className="space-y-1">
               <button
                 onClick={() => handleNav('admin')}
-                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs uppercase tracking-widest transition-all text-left group ${
+                className={`w-full flex items-center justify-between px-3 py-2.5 rounded-lg text-xs uppercase tracking-widest transition-all text-left group ${
                   currentView === 'admin'
-                    ? 'text-white font-bold bg-white/10 border border-white/20'
-                    : 'text-white/60 hover:text-white hover:bg-white/5 border border-white/10'
+                    ? 'text-white font-bold bg-white/10 border border-white/30 shadow-[0_0_15px_rgba(255,255,255,0.08)]'
+                    : 'text-white/70 hover:text-white hover:bg-white/5 border border-white/10'
                 }`}
               >
                 <div className="flex items-center space-x-3">
                   <div
-                    className={`w-1 h-4 rounded-full transition-all ${
-                      currentView === 'admin' ? 'bg-white shadow-[0_0_8px_white]' : 'bg-transparent'
+                    className={`w-1.5 h-4 rounded-full transition-all ${
+                      currentView === 'admin' ? 'bg-white shadow-[0_0_8px_white]' : 'bg-transparent group-hover:bg-white/40'
                     }`}
                   />
                   <Shield className="w-4 h-4 text-white" />
-                  <span>Panel Maestro</span>
+                  <span className="truncate">Panel de Control Total</span>
                 </div>
-                <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-white text-black font-bold">
-                  ADMIN
-                </span>
               </button>
             </nav>
           </div>
