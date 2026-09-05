@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background-color: #000000;
+    color: #ffffff;
+    overflow-x: hidden;
+  }
+}
+
+/* Realistic mist and glowing triangle animation */
+@keyframes mist-breathe {
+  0%, 100% {
+    opacity: 0.6;
+    transform: scale(1);
+    filter: blur(20px);
+  }
+  50% {
+    opacity: 0.85;
+    transform: scale(1.1);
+    filter: blur(26px);
+  }
+}
+
+@keyframes triangle-pulse {
+  0%, 100% {
+    filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.4));
+  }
+  50% {
+    filter: drop-shadow(0 0 20px rgba(255, 255, 255, 0.7));
+  }
+}
+
+.animate-mist {
+  animation: mist-breathe 6s ease-in-out infinite;
+}
+
+.animate-triangle-glow {
+  animation: triangle-pulse 4s ease-in-out infinite;
+}
+
+/* Custom sleek high-contrast scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #000000;
+}
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #52525b;
+}
+

@@ -1,0 +1,6 @@
+{
+  "name": "GREY IA",
+  "description": "Plataforma de producción de inteligencia artificial para chat, dirección cinematográfica, generación de vídeo, imagen, audio, edición multimedia y herramientas virales.",
+  "requestFramePermissions": ["camera", "microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
